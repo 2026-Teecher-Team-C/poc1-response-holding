@@ -17,10 +17,12 @@
 
 | 파일 | 역할 |
 |---|---|
-| `Dockerfile` | `python:3.12-slim` + mitmproxy. 로컬 Python 버전 호환성 문제를 피하려고 컨테이너로 격리 |
+| `Dockerfile` | `python:3.12-slim` + mitmproxy. 로컬 Python 버전 호환성 문제를 피하려고 컨테이너로 격리 (macOS/Linux 권장 경로) |
 | `docker-compose.yml` | 8080 포트 매핑, `addons/`·`.mitmproxy/` 바인드 마운트 |
 | `addons/hold_response.py` | 응답 보류 addon. `time.sleep(3)` 후 `BLOCK` 값에 따라 403 차단 또는 통과 |
 | `testdata/sample.txt` | 테스트용 샘플 다운로드 파일 (13KB) |
+| `requirements.txt` | mitmproxy 버전 고정 (`12.2.3` — Docker 검증에 쓰인 것과 동일 버전) |
+| `windows/` | Docker 없이 Windows에 네이티브로 설치/실행/원복하는 PowerShell 스크립트 모음 |
 
 ### addon 동작
 
@@ -58,7 +60,49 @@ docker compose down
 docker compose restart
 ```
 
-## curl 기반 재현 절차 (시스템 설정 변경 불필요)
+## 실행 방법 (Windows, Docker 없이 네이티브)
+
+Docker Desktop/WSL2 설치가 부담스러운 팀원용 경로. **Python 3.9~3.12** 필요 (3.13+는 mitmproxy 호환성 미검증 — 이 프로젝트를 처음 만들 때 macOS의 Python 3.14 환경에서 mitmproxy 설치가 막혀서 Docker로 우회했던 것과 같은 이유).
+
+```powershell
+cd poc1-response-holding
+.\windows\setup-venv.ps1      # venv 생성 + pip install -r requirements.txt
+.\windows\run-mitmdump.ps1    # mitmdump 실행 (이 창은 열어둔 채로 둘 것)
+```
+
+`BLOCK` 값을 바꾼 뒤에는 `run-mitmdump.ps1`이 떠 있는 창에서 Ctrl+C로 종료했다가 다시 실행하면 된다.
+
+### curl.exe로 재현 (시스템 설정 변경 불필요, 권장 — macOS의 curl 검증과 동일한 방식)
+
+Windows 10/11에는 `curl.exe`가 기본 내장되어 있다. 별도 터미널에서:
+
+```powershell
+python -m http.server 8000 --directory testdata    # 터미널 1: 테스트 파일 서버
+
+# 터미널 2
+curl.exe -x 127.0.0.1:8080 http://localhost:8000/sample.txt -o downloaded_sample.txt `
+     -w "http_code=%{http_code} time_total=%{time_total}s`n"
+```
+
+Windows 네이티브 실행은 mitmdump가 컨테이너가 아니라 호스트에서 직접 돌기 때문에 `host.docker.internal` 없이 `localhost`를 그대로 쓰면 된다.
+
+### 브라우저 테스트용 시스템 프록시 + CA 인증서 설정/원복
+
+시스템 전역 설정을 바꾸는 단계라 스크립트도 사용자가 **관리자 권한 PowerShell**에서 직접 실행해야 한다 (자동 실행하지 않음):
+
+```powershell
+# 관리자 권한 PowerShell에서
+.\windows\setup-proxy.ps1        # 프록시 127.0.0.1:8080 설정 + CA 인증서 신뢰 등록
+# HTTP만 테스트할 거면: .\windows\setup-proxy.ps1 -SkipCert
+
+# ... 브라우저 테스트 (QUIC 우회 주의: chrome://flags/#enable-quic 비활성화 권장) ...
+
+.\windows\revert-proxy.ps1       # 테스트 후 반드시 원복
+```
+
+`setup-proxy.ps1`은 `%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer`를 신뢰할 수 있는 루트 인증 기관에 등록하고 사용자 프록시(레지스트리 `Internet Settings`)를 켠다. `revert-proxy.ps1`은 그 반대로 인증서를 삭제하고 프록시를 끈다. mitmproxy CA를 신뢰 상태로 남겨두면 그 CA로 서명된 모든 HTTPS를 브라우저가 믿게 되므로 테스트 후 원복은 필수다.
+
+## curl 기반 재현 절차 (Docker, 시스템 설정 변경 불필요)
 
 브라우저/시스템 프록시 없이 PoC 동작만 확인하는 경로다.
 
