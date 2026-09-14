@@ -1,0 +1,13 @@
+services:
+  mitm:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./addons:/addons
+      - ./.mitmproxy:/root/.mitmproxy   # CA 인증서를 호스트 파일시스템에 노출
+    tty: true          # mitmdump 로그를 docker compose logs 로 바로 볼 수 있게 함(버퍼링 방지)
+    extra_hosts:
+      # 컨테이너 안에서 호스트의 로컬 서버(python3 -m http.server 8000)에 접근하기 위함
+      - "host.docker.internal:host-gateway"
+    command: ["-s", "/addons/hold_response.py", "-p", "8080"]
