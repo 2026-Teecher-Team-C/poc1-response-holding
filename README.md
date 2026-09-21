@@ -20,6 +20,7 @@
 | `Dockerfile` | `python:3.12-slim` + mitmproxy. 로컬 Python 버전 호환성 문제를 피하려고 컨테이너로 격리 (macOS/Linux 권장 경로) |
 | `docker-compose.yml` | 8080 포트 매핑, `addons/`·`.mitmproxy/` 바인드 마운트 |
 | `addons/hold_response.py` | 응답 보류 addon. `asyncio.sleep(3)` 후 `BLOCK` 값에 따라 403 차단 또는 통과 |
+| `addons/dashboard.py` | Part B — 다운로드 이벤트 대시보드 addon. `hold_response.py`의 보류 기능을 포함하고, 다운로드 판별(`_is_download`)과 SSE 이벤트 스트림(`http://127.0.0.1:8765`)을 추가한다. **`hold_response.py`와 동시에 쓰지 않는다** — 자세한 내용은 [다운로드 이벤트 대시보드 검증](#다운로드-이벤트-대시보드-검증-2026-09-21) 참고 |
 | `testdata/sample.txt` | curl 재현용 텍스트 파일 (13KB, 체크섬 비교용) |
 | `testdata/sample.zip` | 브라우저 다운로드 테스트용 zip (781B) — 이유는 [브라우저 실측 검증](#브라우저-실측-검증-macos-2026-09-15) 참고 |
 | `requirements.txt` | mitmproxy 버전 고정 (`12.2.3` — Docker 검증에 쓰인 것과 동일 버전) |
@@ -547,6 +548,181 @@ hold=300 curl_rc=0 http=200 time=300.013559
 
 curl(자동 재현 가능한 근거)과 브라우저(실제 사용자 경험) 양쪽에서 HTTPS 인터셉션이 HTTP와
 동일하게 동작함을 확인했다. **PoC 1의 최우선 게이트 항목(HTTPS 미검증)이 닫혔다.**
+
+## 다운로드 이벤트 대시보드 검증 (2026-09-21)
+
+> ⚠️ **대시보드는 PoC 전용 구조다.** 최종 아키텍처는 `에이전트 → gRPC → API 서버 → SSE → 콘솔`이며,
+> 이 addon이 직접 여는 로컬 HTTP 서버(`http://127.0.0.1:8765`)는 그 자리를 임시로 대신하는 것뿐이다.
+> 이 PoC 코드를 그대로 최종 에이전트에 남기면 로컬 에이전트가 웹 서버를 품게 되어
+> CLAUDE.md의 "로컬 에이전트는 파일 내용을 파싱하지 않는다 / 공격 표면 최소화" 원칙과 충돌한다.
+> `_is_download()`의 판별 로직과 이벤트 필드 스키마만 상위 설계로 옮기고, 서버 코드 자체는
+> 옮기지 않는다.
+
+Part A(HTTPS 인터셉션)에 이어 절차서 `2026-09-21-poc-https-and-dashboard.md`의 Part B를 검증했다.
+`addons/dashboard.py`는 절차서 B.4 코드와 **byte-identical** (`diff` 무출력, `ast.parse` 통과) —
+의도적인 변경은 없다. 판별 로직이 허술한 부분이 이번 검증에서 드러나지만, 이는 **고칠 대상이
+아니라 측정 결과**다.
+
+### 생성물
+
+`addons/dashboard.py` — `hold_response.py`의 보류 기능을 포함하므로 **`hold_response.py`와
+동시에 쓰지 않는다** (동시에 쓰면 보류가 두 번 걸린다).
+
+```bash
+.venv/bin/mitmdump -s addons/dashboard.py -p 8080 --set confdir=./.mitmproxy
+# 대시보드: http://127.0.0.1:8765
+```
+
+검증은 브라우저 화면이 아니라 `curl -N http://127.0.0.1:8765/events`로 SSE 스트림을 직접
+캡처해 JSON 필드값을 그대로 판정하는 방식으로 진행했다 (필드값이 원문으로 남아 증거력이 높다).
+
+### 검증 기준 6건 (절차서 B.5)
+
+| # | 기준 | 판정 |
+|---|---|---|
+| 1 | 다운로드 1건 → 이벤트 1건 | 통과 |
+| 2 | 일반 웹서핑에 행이 생기지 않음 | **실패** |
+| 3 | `BLOCK=True` → `BLOCKED`/403 | 통과 (단 `mime_type` 오염 발견) |
+| 4 | 동시 3건이 서로 지연되지 않음 | 통과 |
+| 5 | SSE 구독자 2개가 같은 스트림 수신 | 통과 |
+| 6 | HTTPS 다운로드 | 통과 |
+
+#### 기준 1 — SSE 캡처 원문
+
+```
+data: {"event_id": "cae88a2c-...", "created_at": "11:29:07", "request_host": "127.0.0.1", "url": "http://127.0.0.1:8000/sample.zip?t=criterion1", "filename": "sample.zip", "mime_type": "application/zip", "file_size": 781, "sha256": "30c56161...", "held_ms": 3002, "decision": "RELEASED", "decision_source": "POLICY"}
+```
+
+#### 기준 3 — 차단 + `mime_type` 오염
+
+curl `403`, 바디 `Blocked by malware detection platform`. 이벤트:
+
+```
+{"filename": "sample.zip", "mime_type": "text/plain", "file_size": 781, "sha256": "30c56161...", "held_ms": 3003, "decision": "BLOCKED", "decision_source": "POLICY"}
+```
+
+원본 zip의 `application/zip`이 아니라 403 교체 응답의 `text/plain`이 기록됐다. 원인은 코드
+순서다 — `flow.response = http.Response.make(...)`로 응답을 교체한 **뒤에** `_emit()`이
+`flow.response.headers`를 읽는다 (`addons/dashboard.py:48-60`). **`BLOCKED` 이벤트의
+`mime_type`은 구조적으로 항상 오염되며, 차단된 파일이 원래 무엇이었는지가 기록에서 사라진다.**
+상위 ERD로 옮길 때 반드시 인지해야 할 지점이다. (코드는 고치지 않았다)
+
+#### 기준 4 — 동시 3건
+
+```
+held_ms = 3004 / 3003 / 3002
+curl time_total = 3.016 ~ 3.019s
+```
+
+3초/6초/9초로 누적되지 않았다 → 직렬화 아님. `asyncio.sleep` 논블로킹 확인.
+
+#### 기준 5 — SSE 다중 구독
+
+`curl -N /events` 2개를 동시에 열고 다운로드 1건 트리거 → 두 캡처 파일 `diff` 결과 완전 동일
+(접속 시 과거분 3건 replay + 신규 1건).
+
+#### 기준 6 — HTTPS
+
+```
+{"request_host": "www.python.org", "filename": "python-3.12.7-macos11.pkg", "mime_type": "application/octet-stream", "file_size": 45387635, "sha256": "2ec2355c...", "held_ms": 3040, "decision": "RELEASED", "decision_source": "POLICY"}
+```
+
+### 기준 2 — 실패: 판별 로직이 상위 설계로 올라가야 한다는 측정 결과
+
+프록시를 켠 Chrome으로 **약 4분간 일반 웹서핑**(검색, GitHub 문서 열람, YouTube, 앱스토어
+페이지)을 했다. **다운로드는 한 건도 하지 않았다.**
+
+```
+총 이벤트           139건
+실제 다운로드 MIME    0건
+크기                최소 18B / 중앙값 82,980B / 최대 1,628,854B
+64KB 미만인데 이벤트가 된 건   59건
+```
+
+발동 규칙별 (`_is_download()` 역산):
+
+```
+80건  규칙 3 — len(body) >= 64KB
+59건  규칙 1 — Content-Disposition: attachment
+ 0건  규칙 2 — DOWNLOAD_MIMES 일치
+```
+
+MIME 타입별:
+
+```
+46건  text/javascript
+40건  application/json
+20건  application/javascript
+12건  text/css
+ 8건  text/html
+ 8건  image/png
+ 3건  text/plain
+ 1건  application/x-protobuffer
+ 1건  image/webp
+```
+
+호스트별:
+
+```
+78건  www.google.com
+30건  github.githubassets.com
+ 8건  www.gstatic.com
+ 8건  camo.githubusercontent.com
+ 6건  www.youtube.com
+ 3건  ep1.adtrafficquality.google
+ 2건  github.com
+ 2건  play.google.com
+ 1건  encrypted-tbn0.gstatic.com
+ 1건  googleads.g.doubleclick.net
+```
+
+**핵심 발견 — `Content-Disposition: attachment`는 다운로드 신호가 아니다.**
+59건은 크기가 18~459바이트인데도 이벤트가 됐다. 익명화한 표본(URL 경로는 남기되 쿼리
+파라미터는 잘라냈다):
+
+```
+size=19   filename='f.txt'   경로=/async/ddljson
+size=18   filename='f.txt'   경로=/async/newtab_promos
+size=168  filename='f.txt'   경로=/complete/search   (쿼리에 xssi=t 포함)
+```
+
+URL 경로 어디에도 `f.txt`가 없다 → `filename`이 `Content-Disposition` 헤더에서 온 것이다.
+즉 **Google이 18바이트 JSON API 응답에 `Content-Disposition: attachment; filename="f.txt"`를
+붙이고 있다.** 브라우저가 응답을 렌더링하거나 MIME 스니핑하지 못하게 막는 보안 하드닝
+(anti-XSSI) 기법이며, 요즘 API에서 흔하다. 절차서가 **가장 신뢰할 만한 다운로드 신호로 쓴
+헤더가 실제로는 다운로드와 무관**하다는 뜻이므로, 크기 폴백만 조여서 해결되는 문제가 아니다.
+
+**오탐은 행만 늘리는 게 아니다 — 웹서핑이 느려진다.**
+`dashboard.py`는 `판별 → 3초 보류 → 이벤트` 순서다. 따라서 139건이 **전부 3초씩 지연됐다.**
+검색 한 번에 JS 번들 수십 개가 3초씩 밀린다. 오탐은 DB 오염 이전에 **사용성 문제**다.
+
+**규모.** 4분에 139건 ≈ 시간당 약 2,000행, 8시간 근무 기준 장비 한 대당 약 16,000행. 각 행에
+URL 전문이 들어간다. 상위 ERD 6장이 우려한 "`download_events`가 브라우징 이력 DB가 된다"가
+수치로 확인된 지점이다.
+
+### `download_events` 필드 NULL 감사 (절차서 B.7)
+
+| 필드 | 실제 값 | 비고 |
+|---|---|---|
+| `event_id` | 항상 채워짐 (UUID) | |
+| `created_at` | 항상 채워짐 (`HH:MM:SS`) | 날짜가 없어 자정을 넘기면 정렬이 모호해진다 |
+| `request_host` | 항상 채워짐 | |
+| `url` | 항상 채워짐 (쿼리스트링 포함 전문) | 보존·마스킹 정책 필요 |
+| `filename` | 거의 항상 채워짐. 경로가 `/`로 끝나면 `"(no name)"` | 공격자가 정한 값 — 표시만, 경로로 쓰지 않는다 |
+| `mime_type` | **실제로 NULL이 나오는 유일한 칸** — `Content-Type`이 없으면 빈 문자열. `BLOCKED` 건에서는 위 오염 버그 | |
+| `file_size` | **항상 채워짐** | 절차서 B.3/B.7은 "chunked면 `Content-Length`가 없어 NULL 우려"라고 적었으나, 실제 B.4 구현은 헤더를 안 쓰고 `len(flow.response.content)`(버퍼 실제 바이트)를 쓴다. chunked 응답에서도 정확한 바이트 수가 기록됐다. **절차서 본문과 구현 코드의 불일치**이며, 구현 쪽이 더 견고하다 |
+| `sha256` | 항상 채워짐 | |
+| `held_ms` | 항상 채워짐 (3000~3040ms) | |
+| `decision` | 항상 `RELEASED`/`BLOCKED` | |
+| `decision_source` | 항상 `POLICY` (하드코딩) | PoC라 의도된 것 |
+
+### 결론
+
+통과한 4건(동시성, SSE 다중 구독, HTTPS, 필드 스키마 대체로 견고)과 기준 3의 `mime_type`
+오염, 기준 2의 실패를 함께 보면: **SSE 스트리밍과 이벤트 스키마 자체는 상위 서버로 옮길
+준비가 됐지만, `_is_download()` 판별 로직은 PoC 수준을 벗어나지 못했다.** 특히
+`Content-Disposition: attachment` 단독 신호는 신뢰할 수 없다는 것이 이번 실측의 핵심
+결과이며, 상위 설계의 다운로드 판별 로직에 반영되어야 한다.
 
 ## 참고
 
