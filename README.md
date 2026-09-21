@@ -219,10 +219,13 @@ content-length: 37
 
 ### 아직 검증되지 않은 것
 
-curl 기반 검증(위)에 이어 실제 브라우저 레벨 검증도 완료했다 (아래 [브라우저 실측 검증](#브라우저-실측-검증-macos-2026-09-15) 참고). 남은 항목:
+curl 기반 검증(위)에 이어 실제 브라우저 레벨 검증도 완료했다 (아래 [브라우저 실측 검증](#브라우저-실측-검증-macos-2026-09-15) 참고).
+2026-09-21에 HTTPS 인터셉션, 실제 인터넷 오리진, 대용량 파일 메모리 버퍼링, 보류 상한 실측을
+추가로 마쳤다 (아래 [HTTPS 인터셉션 및 보류 상한 실측](#https-인터셉션-및-보류-상한-실측-macos-2026-09-21) 참고). 남은 항목:
 
-- HTTPS 인터셉션 (CA 신뢰 등록 자체는 아직 실제로 성공시켜보지 못함 — 아래 참고)
-- 대용량 파일에서의 메모리 버퍼링 거동 (`flow.response.stream`)
+- 스트리밍 모드(`flow.response.stream`) 헤더 타이밍 — 지금까지는 전부 `stream=False`(전체 버퍼링)로만 검증했다
+- Safari·Firefox의 보류 상한 (Chrome만 300초까지 확인)
+- HTTPS에서의 보류 상한 (아래 실측은 전부 HTTP 오리진, `http.server` 기준)
 
 ## 수동 설정 가이드 (macOS) — 사용자가 직접 진행
 
@@ -306,6 +309,244 @@ curl 기반 검증 이후, 실제 Chrome 브라우저로도 성공 기준 3개�
 | `BLOCK=True`, 동일 URL | 약 3초 지연 후 403 "Blocked by malware detection platform", 파일 미저장 (스크린샷 확보) |
 
 curl(자동 재현 가능한 근거)에 이어 브라우저(실제 사용자 경험)에서도 응답 보류 전제가 검증됐다.
+
+## HTTPS 인터셉션 및 보류 상한 실측 (macOS, 2026-09-21)
+
+CLAUDE.md에 정의된 이 저장소의 최우선 게이트 항목(HTTPS 인터셉션 미검증)을 닫는 실측이다.
+`addons/hold_response.py`는 **한 줄도 고치지 않았다** — mitmproxy가 TLS를 종료하고 평문 flow를
+그대로 `response` 훅에 넘겨주는지만 확인하는 것이 목적이므로, addon이 HTTPS를 의식할 필요가
+없다는 것 자체가 검증 대상이다.
+
+### 환경
+
+```
+Mitmproxy: 12.2.3
+Python:    3.14.7
+OpenSSL:   OpenSSL 4.0.1 9 Jun 2026
+Platform:  macOS-26.6.2-arm64-arm-64bit-Mach-O
+```
+
+Docker가 아니라 **호스트에서 직접** `mitmdump`를 실행했다 (컨테이너 안 `~/.mitmproxy`와 호스트
+키체인이 달라 변수가 하나 느는 것을 피하려는 선택). 의존성은 저장소 `.venv`에 설치.
+
+CA는 새로 만들지 않고 2026-09-14 Docker 실행 때 생성된 저장소 `./.mitmproxy/`를 그대로 재사용했다:
+
+```
+sha1 Fingerprint=5A:A0:B7:4D:35:2E:26:33:23:5F:5D:1E:22:C3:CA:36:88:74:CE:64
+subject=CN=mitmproxy, O=mitmproxy
+notBefore=Sep 12 14:21:00 2026 GMT
+notAfter=Sep  9 14:21:00 2036 GMT
+```
+
+### 재현 절차 (호스트 네이티브)
+
+```bash
+cd poc1-response-holding
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+mitmdump --set confdir=./.mitmproxy -s addons/hold_response.py
+```
+
+CA를 **로그인 키체인이 아니라 시스템 키체인**에 절대 경로로 등록 (사용자 직접 수행 — 시스템 전역
+설정 변경이므로 자동화하지 않는다):
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \
+     "$(pwd)/.mitmproxy/mitmproxy-ca-cert.pem"
+```
+
+시스템 프록시는 건드리지 않고, Chrome은 격리 프로필로 띄워서 검증한다:
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --user-data-dir=/tmp/poc-chrome \
+    --proxy-server=127.0.0.1:8080 \
+    --disable-quic
+```
+
+### A. HTTPS 인터셉션 — curl (실제 인터넷 오리진)
+
+대상: `https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg` (45,387,635 bytes).
+선정 이유: HTTPS 직링크, 리다이렉트 없이 200, `Content-Length` 명시, 피닝 없음.
+
+탈락 후보: `https://get.videolan.org/vlc/3.0.21/macosx/vlc-3.0.21-arm64.dmg` — HEAD 요청이 302로
+`http://ftp.kaist.ac.kr/...`(비-TLS 미러)로 넘어가 HTTPS 인터셉션 측정에 부적합했다. **피닝이나
+HSTS 실패가 아니므로 `bypass_domains` 후보는 아니다.**
+
+```
+① 기준선 (프록시 미경유)
+$ curl -o base.bin -w 'http=%{http_code} time=%{time_total} size=%{size_download}\n' "$URL"
+http=200 time=3.899985 size=45387635
+$ shasum -a 256 base.bin
+2ec2355c1b3225ce1075fc1b562a6e113017aa6177df87c410667638c1574a09  base.bin
+
+② 통과 (BLOCK=False, 프록시 경유)
+$ curl -x http://127.0.0.1:8080 --cacert .mitmproxy/mitmproxy-ca-cert.pem \
+    -o via.bin -w 'http=%{http_code} time=%{time_total} size=%{size_download}\n' "$URL"
+http=200 time=7.845719 size=45387635
+$ shasum -a 256 via.bin
+2ec2355c1b3225ce1075fc1b562a6e113017aa6177df87c410667638c1574a09  via.bin
+
+③ 차단 (BLOCK=True, 프록시 경유)
+$ curl -x http://127.0.0.1:8080 --cacert .mitmproxy/mitmproxy-ca-cert.pem \
+    -o blocked.bin -w 'http=%{http_code} time=%{time_total} size=%{size_download}\n' "$URL"
+http=403 time=7.229562 size=37
+$ cat blocked.bin
+Blocked by malware detection platform
+```
+
+mitmdump 로그 — `CONNECT`로 끝나지 않고 `GET https://...`가 그대로 찍힌다. TLS를 종료하고
+평문 flow를 훅에 넘겨준다는 직접 증거다:
+
+```
+[10:39:55.936][127.0.0.1:55717] client connect
+[10:39:55.987][127.0.0.1:55717] server connect www.python.org:443 (151.101.192.223:443)
+127.0.0.1:55717: GET https://www.python.org/ftp/python/3.12.7/python-3.12.7-… HTTP/2.0
+     << HTTP/2.0 200 OK 43.3m
+[10:40:03.781][127.0.0.1:55717] client disconnect
+```
+
+체크섬은 기준선·통과 양쪽 다 `2ec2355c1b3225ce1075fc1b562a6e113017aa6177df87c410667638c1574a09`로
+동일 — HTTPS 응답을 붙잡았다가 통과시켜도 훼손되지 않는다.
+
+### A-4. HTTPS 인터셉션 — Chrome 실측
+
+`BLOCK=False` — 인증서 경고 없이 정상 다운로드:
+
+```
+127.0.0.1:56006: GET https://www.python.org/ftp/python/3.12.7/python-3.12.7-… HTTP/2.0
+     << HTTP/2.0 200 OK 43.3m
+```
+
+`BLOCK=True`:
+
+```
+127.0.0.1:56021: GET https://www.python.org/ftp/python/3.12.7/python-3.12.7-… HTTP/2.0
+     << HTTP/1.1 403 Forbidden 37b
+```
+
+- 화면 표시: `Blocked by malware detection platform`
+- **`chrome://downloads`에 새 항목이 생기지 않는다.** "실패한 다운로드 항목이 남는 것"과
+  "애초에 항목이 생기지 않는 것"의 차이이며, 이 프로젝트가 EDR·백신류(사후 탐지)와 갈리는
+  지점이 바로 여기다 — 헤더 전송 전 보류이므로 브라우저 입장에서는 다운로드가 시작된 적이 없다.
+- 같은 URL을 캐시 없이 재요청하려고 URL 뒤에 `?v=2`를 붙였다 (같은 URL 재시도 시 브라우저
+  캐시로 요청 자체가 프록시까지 안 나갈 수 있다).
+
+### A.6 보류 상한 — curl (대조군)
+
+`asyncio.sleep` 값만 파라미터화한 측정 전용 addon으로 쟀다 (`hold_response.py`는 무수정 보존).
+오리진은 로컬 `http.server` + `testdata/sample.zip`(781 bytes) — 전송 시간이라는 변수를 없애고
+순수 보류 시간만 재기 위함이다.
+
+```
+hold=3   curl_rc=0 http=200 time=3.012619
+hold=10  curl_rc=0 http=200 time=10.013706
+hold=30  curl_rc=0 http=200 time=30.014502
+hold=60  curl_rc=0 http=200 time=60.013046
+hold=120 curl_rc=0 http=200 time=120.013468
+hold=300 curl_rc=0 http=200 time=300.013559
+```
+
+6구간 전부 통과. 서버 측 훅 로그도 전 구간 `ENTER → EXIT elapsed=N.00s`로 완주했다. **curl은
+기본 응답 타임아웃이 없어 상한을 정하지 않는다 — 즉 이 대조군에서 상한을 정하는 쪽은 서버가
+아니라 클라이언트다.**
+
+### A.6 보류 상한 — Chrome
+
+`HOLD_SECONDS=300`, `http://10.96.203.230:8000/sample.zip`:
+
+```
+[11:01:30.567][127.0.0.1:55909] client connect
+[11:01:30.572][127.0.0.1:55909] server connect 10.96.203.230:8000
+[probe] ENTER  hold=300.0s wall=11:01:32 url=http://10.96.203.230:8000/sample.zip
+[11:01:32.931][127.0.0.1:55909] server disconnect 10.96.203.230:8000
+[probe] EXIT   hold=300.0s wall=11:06:32 elapsed=300.00s url=http://10.96.203.230:8000/sample.zip
+127.0.0.1:55909: GET http://10.96.203.230:8000/sample.zip HTTP/1.1
+     << HTTP/1.0 200 OK 781b
+```
+
+- 이 연결에 `client disconnect`가 없다 → **Chrome은 300초를 포기하지 않았다.**
+- 저장된 파일 무결성 확인: 원본 SHA-256 `30c56161423e0e9d571815efc4335d691694985e631853c5ef7e1501f7fe09d3`,
+  `~/Downloads/sample.zip` 동일.
+- **결론: Chrome 기준 보류 상한은 300초 초과(T > 300s). 5분까지는 검사 파이프라인의 제약이
+  아니다.** 단 Safari·Firefox는 미측정이고, HTTPS에서 이 값이 달라질 가능성도 미검증이다.
+
+### 부수 발견
+
+1. **`stream=False`라 보류가 다운로드 시간 위에 얹힌다.** 기준선 3.899985s vs 프록시 경유
+   7.845719s — 45MB를 전부 메모리에 버퍼링한 뒤에야 `response` 훅이 불린다. 사용자 체감 지연은
+   `다운로드 시간 + 검사 시간`이 된다. 위 "아직 검증되지 않은 것"의 메모리 버퍼링 항목에 대한
+   실측치다.
+2. **보류 중 실제로 열려 있는 건 프록시↔브라우저 구간뿐이다.** 훅 진입 직후 `server disconnect`
+   가 찍힌다 — 오리진 연결은 이미 닫혀 있다. 즉 검사 시간 예산에서 오리진 타임아웃은 제약이
+   아니다. 단, 이번 오리진은 응답 후 즉시 연결을 닫는 HTTP/1.0 `http.server`였고, keep-alive를
+   쓰는 실제 CDN에서도 동일한지는 미확인이다.
+3. **`BLOCK = True`는 다운로드만이 아니라 프록시를 경유하는 모든 응답을 차단한다.** 해당 세션
+   로그에 403이 30건 찍혔다. PoC 1에는 다운로드 여부 판별이 없기 때문이며, 그 자리가 Part B의
+   `_is_download()`다. PoC 1 단계의 알려진 한계로 남겨둔다.
+4. **TLS 핸드셰이크 실패는 관측됐지만 재현되지 않았다 — 피닝으로 단정할 수 없다.**
+   CA 등록 직후인 11:01 세션에서 Chrome의 백그라운드 통신이
+   `Client TLS handshake failed. The client does not trust the proxy's certificate`로
+   49건 실패했다 (`accounts.google.com`, `clients2.google.com`, `update.googleapis.com`,
+   `www.gstatic.com`, `safebrowsing.googleapis.com`, `chrome.google.com`,
+   `android.clients.google.com`, `clientservices.googleapis.com`,
+   `optimizationguide-pa.googleapis.com`).
+
+   처음에는 Chrome 자체 인증서 피닝으로 판단했으나, **이후 세션에서 같은 도메인이 통과하면서
+   그 판단이 뒤집혔다.**
+
+   | 세션 | 시각 | `does not trust the proxy's certificate` 실패 |
+   |---|---|---|
+   | A.6 Chrome (측정용 addon) | 11:01 | 49건 |
+   | A-4 통과 (`BLOCK=False`) | 11:09 | 1건 |
+   | A-4 차단 (`BLOCK=True`) | 11:11 | 0건 |
+   | 파일 호스팅 도메인 확인 | 11:18 | 0건 |
+
+   11:18 세션에서 `accounts.google.com`은 3회 등장해 **실패 0건**, `www.gstatic.com`은 25회
+   등장해 실패 1건이었다. 같은 세션의 실패 3건은 문구 자체가 다르다 —
+   `The client disconnected during the handshake`(클라이언트가 핸드셰이크 도중 끊음, 탭 이동 등)
+   로, 신뢰 실패와 원인이 다르다.
+
+   **11:01의 실패 원인은 확정하지 못했다.** CA를 시스템 키체인에 등록한 직후 Chrome을 띄운
+   타이밍과 관련이 있어 보이나 근거가 없으므로 추측을 기록하지 않는다. 재현되면 그때 원인을
+   규명한다.
+
+5. **Google 파일 호스팅 도메인은 인터셉션된다 — `bypass_domains` 후보가 아니다.**
+   위 4번 때문에 "Google 도메인을 통째로 바이패스해야 하나"가 쟁점이 됐다. 만약
+   `drive.google.com`이 피닝돼 있다면 실제 악성코드 유포 경로 하나가 검사 없이 통과한다는
+   뜻이므로 별도로 확인했다.
+
+   ```
+   127.0.0.1:56175: GET https://drive.google.com/ HTTP/2.0
+   127.0.0.1:56219: GET https://dl.google.com/chrome/mac/universal/stable/GGRO/… HTTP/2.0
+   127.0.0.1:56223: GET https://storage.googleapis.com/ HTTP/2.0
+   ```
+
+   | 도메인 | Chrome 결과 |
+   |---|---|
+   | `drive.google.com` | 인증서 경고 없이 정상 표시 |
+   | `dl.google.com` | 설치 파일 다운로드 시작됨 |
+   | `storage.googleapis.com` | GCS가 `MissingSecurityHeader` XML 반환, Chrome이 본문 렌더링 |
+
+   `storage.googleapis.com`의 XML 오류는 인증 없이 버킷 목록을 요청했을 때의 GCS 정상 응답이다.
+   중요한 건 **응답 본문이 프록시를 통과해 브라우저 화면에 닿았다는 것**이다. 세 도메인 모두
+   평문 요청 라인이 찍혔고 핸드셰이크 실패는 0건이다.
+
+   **결론: 이 PoC에서 피닝으로 확인된 도메인은 없다. `bypass_domains` 초기 데이터 후보는
+   현재 비어 있다.** 다만 바이패스 목록을 만들 때 `*.google.com` 같은 와일드카드를 쓰면
+   `drive.google.com`이 함께 빠져 검사 구멍이 되므로, 정확한 호스트명 단위로만 등록해야 한다.
+
+### 알려진 함정 (Part A에서 추가로 밟은 것)
+
+- **CA를 상대 경로로 키체인에 등록하면 `Error reading file`이 난다.**
+  `security add-trusted-cert -k ... .mitmproxy/mitmproxy-ca-cert.pem`처럼 상대 경로를 쓰면 실행
+  셸의 cwd가 저장소 루트가 아닌 순간 조용히 실패한다. 항상 절대 경로(`$(pwd)/...`)로 등록할 것.
+- **같은 URL을 재요청하면 캐시 때문에 프록시까지 요청이 안 나갈 수 있다.** 재현 시 URL 뒤에
+  `?v=2` 같은 더미 쿼리를 붙여 캐시를 우회한다.
+
+curl(자동 재현 가능한 근거)과 브라우저(실제 사용자 경험) 양쪽에서 HTTPS 인터셉션이 HTTP와
+동일하게 동작함을 확인했다. **PoC 1의 최우선 게이트 항목(HTTPS 미검증)이 닫혔다.**
 
 ## 참고
 
