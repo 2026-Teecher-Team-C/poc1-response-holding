@@ -22,22 +22,31 @@
 
 | 항목 | 상태 |
 |---|---|
-| 포워드 프록시 + 응답 보류 + 403 교체 | ✅ curl·Chrome 실측 (README "검증 결과") |
+| 포워드 프록시 + 응답 보류 + 403 교체 | ✅ curl·Chrome 실측 |
 | 동시 요청 논블로킹 (`asyncio.sleep`) | ✅ |
-| **HTTPS 인터셉션** | ❌ **미검증 — 최우선** |
-| 보류 가능 시간의 상한 | ❌ 3초만 확인 |
+| **HTTPS 인터셉션** | ✅ **게이트 통과** — addon 무수정, python.org 45MB, 체크섬 일치 |
+| 실제 인터넷 오리진 | ✅ |
+| 보류 가능 시간의 상한 | ✅ Chrome·curl 300초 초과 (Safari·Firefox·HTTPS 경로는 미측정) |
+| 이벤트 대시보드 (SSE) | ✅ 검증 기준 6건 중 5건 통과 |
+| **다운로드 판별 규칙** | ❌ **사용 불가 — 웹서핑 4분에 오탐 139건** |
 | 스트리밍 모드 헤더 타이밍 | ❌ `stream=False`(전체 버퍼링)로만 검증 |
-| 실제 인터넷 오리진 | ❌ LAN `http.server`만 |
 
-**PoC 1은 "완료"가 아니라 "HTTP에서 완료"다.**
+**PoC 1의 게이트는 닫혔다. 남은 문제는 판별 규칙이다.**
 
 ## 지금 할 일
 
-절차서 전문(코드 포함)은 여기에 있다 — 작업 시작 전에 읽을 것:
+**`docs/2026-09-21-next-detection-redesign.md`를 먼저 읽을 것.** 다운로드 판별 재설계와
+`responseheaders` 전환을 **한 번에** 해야 하는 이유, 헤더를 흘려보내면 되돌릴 수 없다는 제약,
+검증 기준이 거기 있다.
+
+배경이 되는 실측 결과는 상위 저장소에 있다:
 
 ```
-/Users/hangjung-macbook/Desktop/Dev/project/docs/superpowers/specs/2026-09-21-poc-https-and-dashboard.md
+/Users/hangjung-macbook/Desktop/Dev/project/docs/superpowers/specs/2026-09-21-poc1-results-and-download-detection.md
+/Users/hangjung-macbook/Desktop/Dev/project/docs/superpowers/specs/2026-09-21-poc-https-and-dashboard.md  (Part A·B 절차서 — 완료)
 ```
+
+아래 Part A·B는 **완료됐다.** 기록으로만 남긴다.
 
 ### Part A — HTTPS 인터셉션 검증
 

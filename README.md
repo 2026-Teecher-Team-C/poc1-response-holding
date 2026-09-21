@@ -20,7 +20,7 @@
 | `Dockerfile` | `python:3.12-slim` + mitmproxy. 로컬 Python 버전 호환성 문제를 피하려고 컨테이너로 격리 (macOS/Linux 권장 경로) |
 | `docker-compose.yml` | 8080 포트 매핑, `addons/`·`.mitmproxy/` 바인드 마운트 |
 | `addons/hold_response.py` | 응답 보류 addon. `asyncio.sleep(3)` 후 `BLOCK` 값에 따라 403 차단 또는 통과 |
-| `addons/dashboard.py` | Part B — 다운로드 이벤트 대시보드 addon. `hold_response.py`의 보류 기능을 포함하고, 다운로드 판별(`_is_download`)과 SSE 이벤트 스트림(`http://127.0.0.1:8765`)을 추가한다. **`hold_response.py`와 동시에 쓰지 않는다** — 자세한 내용은 [다운로드 이벤트 대시보드 검증](#다운로드-이벤트-대시보드-검증-2026-09-21) 참고 |
+| `addons/dashboard.py` | Part B — 다운로드 이벤트 대시보드 addon. `hold_response.py`의 보류 기능을 포함한다. 판별은 `responseheaders` 훅(본문 수신 전, `Sec-Fetch-*` 요청 맥락 + 응답 헤더)에서 내리고, 다운로드가 아니면 `flow.response.stream = True`로 버퍼링·보류·이벤트를 전부 건너뛴다. 다운로드 후보만 `response` 훅에서 보류·403 교체·SSE 이벤트(`http://127.0.0.1:8765`)로 이어진다. 절차서 B.4 원본에서 재설계됐다(더 이상 byte-identical 아님) — 자세한 내용은 [다운로드 판별 재설계 실측](#다운로드-판별-재설계-실측-2026-09-21) 참고. **`hold_response.py`와 동시에 쓰지 않는다** |
 | `testdata/sample.txt` | curl 재현용 텍스트 파일 (13KB, 체크섬 비교용) |
 | `testdata/sample.zip` | 브라우저 다운로드 테스트용 zip (781B) — 이유는 [브라우저 실측 검증](#브라우저-실측-검증-macos-2026-09-15) 참고 |
 | `requirements.txt` | mitmproxy 버전 고정 (`12.2.3` — Docker 검증에 쓰인 것과 동일 버전) |
@@ -723,6 +723,187 @@ URL 전문이 들어간다. 상위 ERD 6장이 우려한 "`download_events`가 �
 준비가 됐지만, `_is_download()` 판별 로직은 PoC 수준을 벗어나지 못했다.** 특히
 `Content-Disposition: attachment` 단독 신호는 신뢰할 수 없다는 것이 이번 실측의 핵심
 결과이며, 상위 설계의 다운로드 판별 로직에 반영되어야 한다.
+
+## 다운로드 판별 재설계 실측 (2026-09-21)
+
+위 절의 139건 오탐을 닫기 위해 `docs/2026-09-21-next-detection-redesign.md` 절차서에 따라
+판별 로직을 `responseheaders` 훅으로 옮기고 `Sec-Fetch-*` 기반 맥락 규칙으로 재설계한 뒤
+재실측했다.
+
+### 구현 구조 변경
+
+```
+responseheaders 훅   요청 맥락(Sec-Fetch-*) + 응답 헤더로 판정 (본문 없음)
+   다운로드 아님 → flow.response.stream = True   버퍼링·보류·이벤트 전부 없음
+   다운로드     → 버퍼 유지, response 훅으로 진행
+
+response 훅         보류 → 판정 → 릴리스/403 → 이벤트 emit
+```
+
+**헤더가 브라우저로 나간 뒤에는 보류도 차단도 불가능하므로, `responseheaders`에서 내리는 판정은
+최종 결정이다.** "일단 흘려보내고 나중에 승격"은 성립하지 않는다.
+
+### 측정 조건
+
+프록시를 켠 Chrome 별도 프로필(`--proxy-bypass-list="<-loopback>" --disable-quic`)로 테스트
+다운로드 ①②③④를 각 1회 클릭한 뒤, **다운로드 없이 약 4분간 일반 웹서핑**(검색·GitHub·YouTube·
+Reddit 등). 세션 전체 응답 1,152건.
+
+기동:
+
+```bash
+.venv/bin/mitmdump -s addons/dashboard.py -p 8080 --set confdir=./.mitmproxy
+```
+
+### 구 규칙 대비
+
+```
+구 규칙(절차서 B.4)  약 78건   ← 같은 세션 데이터에 소급 적용. 로그에 Content-Disposition이
+                                 일부만 남아 하한선이다
+신 규칙(A안)          20건
+```
+
+직전 측정([위 절](#다운로드-이벤트-대시보드-검증-2026-09-21), 구 규칙 실측)에서는 4분 웹서핑에
+139건이었다.
+
+### 이벤트 20건의 내역
+
+| 건수 | 정체 | 성격 |
+|---|---|---|
+| 4 | 테스트 다운로드 ①②③④ | 의도한 탐지 |
+| 13 | Chrome 자동 업데이트 (`edgedl.me.gvt1.com`, `clients2.googleusercontent.com`, `r3---sn-3u-bh2ly.gvt1.com`) | 진짜 파일 다운로드. 오탐 아님 |
+| 1 | `clients2.google.com` anti-XSSI | 오탐 |
+| 1 | `safebrowsing.googleapis.com` | 오탐 |
+| 1 | `www.reddit.com` | 오탐 |
+
+**순수 오탐 3건.**
+
+### 맥락별 전체 응답 분포
+
+```
+550건  no-cors
+536건  cors
+ 34건  navigate
+ 14건  fallback
+ 12건  same-origin
+```
+
+### 발동 규칙별 (A안, 다운로드로 판정된 20건)
+
+```
+14건  rule1_content_disposition
+ 4건  rule2_mime
+ 2건  rule3_size_fallback
+```
+
+### 오탐 3건의 원인 — 각각 다른 구멍이다
+
+**① `safebrowsing.googleapis.com`**
+
+```
+application/x-protobuf   8,679,999 bytes   ctx=no-cors   rule3_size_fallback
+path=/v4/threatListUpdates:fetch
+```
+
+Chrome Safe Browsing 위협 DB 업데이트. `application/x-protobuf`가 규칙 3의 제외 MIME 목록에
+없어 크기 폴백에 걸렸다.
+
+**② `www.reddit.com`**
+
+```
+application/octet-stream   ctx=cors   rule2_mime
+path=/svc/shreddit/compression-dictionaries/br/dict-a6e9d3b5...
+```
+
+Reddit이 Brotli 압축 사전을 `application/octet-stream`으로 fetch 받는다. `cors` 분기의
+"다운로드 MIME일 때만 인정" 규칙을 정확히 통과한다. **`octet-stream`이 곧 다운로드라는 전제가
+깨지는 사례다.**
+
+**③ `clients2.google.com`**
+
+```
+application/json   80 bytes   filename="json.txt"   ctx=fallback
+```
+
+anti-XSSI 패턴. `Sec-Fetch`가 없는 폴백 경로라 맥락 필터가 걸리지 않는다.
+
+### Chrome 자동 업데이트 13건 — 오탐이 아니지만 설계 쟁점이다
+
+```
+/edgedl/release2/chrome_component/V3P1l2hLvLw_7/7_all_sslErrorAssistant.crx3
+/edgedl/diffgen-puffin/ceofaddefefcbblgcgnibnonglccbfja/f1eb9ab2...
+/edgedl/chromewebstore/.../1.0.0.6_nmmhkkegccagdldgiimedpiccmgmieda.crx
+```
+
+`gvt1.com`은 Chrome이 컴포넌트·확장 업데이트를 받는 CDN이다. 전부 `ctx=fallback`(Chrome 네트워크
+서비스가 직접 보내는 요청이라 `Sec-Fetch`가 없다).
+
+**진짜 파일 다운로드이므로 판별 규칙은 정상 동작한 것이다.** 다만 두 가지 함의가 있다:
+
+- 사용자가 아무것도 하지 않아도 이벤트가 생기므로 **검증 기준 1의 "이벤트 0건"은 달성 불가능한
+  목표다**
+- fail-close 정책상 검사 서버에 닿지 못하면 이들이 차단된다 → **Chrome의 보안 업데이트와 Safe
+  Browsing 위협 DB 갱신이 조용히 막힌다.** 악성코드를 막으려다 브라우저의 방어 기능을 끄는
+  결과가 될 수 있다
+
+→ `bypass_domains`의 첫 실제 후보이며, 인증서 피닝과는 **사유가 다르다**(브라우저 자체 업데이트
+인프라). 스키마에 사유 구분이 필요할 수 있다.
+
+### A안 vs B안 — A안 채택
+
+```
+A안(Content-Length가 있을 때만 크기 폴백)  20건
+B안(크기 폴백 폐기)                        18건
+두 안이 갈린 건                             2건
+   clients2.googleusercontent.com  application/x-chrome-extension    161,196  ctx=no-cors
+   safebrowsing.googleapis.com     application/x-protobuf          8,679,999  ctx=no-cors
+```
+
+갈린 2건이 모두 사용자 다운로드가 아니고, 테스트 다운로드 ①②③④는 넷 다 규칙 3 없이 탐지됐다.
+**정상 트래픽만 보면 B안이 유리해 보인다.**
+
+**그럼에도 A안을 채택한다.** 근거:
+
+- 이 비교는 정상 트래픽만 본 것이다. 공격자는 자기 서버를 통제하므로 `Content-Disposition`을
+  붙이지 않고 `Content-Type`을 제외 목록에 없는 값으로 주면 된다. B안에서는 규칙 1·2가 걸리지
+  않고 크기 폴백도 없어 **그 다운로드가 관측되지 않는다.** A안은 크기 폴백으로 잡는다
+- 못 잡는 비용(악성코드가 디스크에 닿음)과 잘못 잡는 비용(3초 지연 + 행 하나)은 대칭이 아니다
+- CLAUDE.md의 fail-close 고정 결정과 같은 방향이다. 판별에서만 "확신 없으면 흘려보낸다"를 쓰면
+  일관성이 깨진다
+- 측정된 비용은 1,152건 중 2건이다
+
+**A안의 한계도 함께 기록한다:** 규칙 3의 제외 목록은 블록리스트다. 공격자가 `image/png`나
+`text/html`로 위장하면 A안에서도 크기 폴백을 피해간다. A안이 B안보다 넓게 잡는 범위는 "제외
+목록에 없는 비렌더링 MIME"뿐이다. 제외 목록을 화이트리스트 방향으로 뒤집는 설계는 상위 검토
+대상이다.
+
+### 검증 기준 6건 판정 (지시서 기준)
+
+| # | 기준 | 판정 |
+|---|---|---|
+| 1 | 일반 웹서핑 4분 → 이벤트 0건 | **부분 달성** — 20건(순수 오탐 3건). 구 규칙 139건 대비. 0건은 Chrome 자동 업데이트 때문에 달성 불가능한 목표였다 |
+| 2 | 다운로드 ①②③④ 전부 탐지 | **통과** — 4건 전부 |
+| 3 | 비다운로드 트래픽 지연 없음 | **통과** — 사용자 체감 확인("빠릿했다"). 구 규칙에서는 서브리소스가 건당 3초씩 밀렸다 |
+| 4 | 45MB HTTPS 다운로드 | **통과** — `http=200 size=45387635 time=7.633714s`, SHA-256 `2ec2355c1b3225ce1075fc1b562a6e113017aa6177df87c410667638c1574a09` 일치 |
+| 5 | 메모리 | **미측정** |
+| 6 | 폴백 경로 오탐 | **측정됨** — curl로 일반 HTML 8개 페이지: 0건. 브라우저 실측: 1건(`clients2.google.com` anti-XSSI). curl은 서브리소스를 받지 않아 재현 조건이 다르다 |
+
+### 부수 — `mime_type` 오염 수정 확인
+
+`responseheaders` 시점에 원본 `Content-Type`을 스냅샷해서 `flow.metadata`에 보관하고, 403 교체
+후 `_emit()`이 그 값을 쓰도록 고쳤다. `BLOCK=True`로 검증: 원본이 `application/x-test-binary`였던
+응답을 차단했을 때 이벤트에 `application/x-test-binary`가 정확히 기록됐다(수정 전에는
+`text/plain`으로 오염됐을 자리).
+
+### 결론
+
+통과한 4건(다운로드 4종 전부 탐지, 서브리소스 지연 없음, HTTPS, `mime_type` 오염 수정)과
+20건 중 순수 오탐 3건, 그리고 A안 채택 근거를 함께 보면: **`Sec-Fetch` 기반 맥락 규칙 전환으로
+오탐이 139건에서 20건(순수 오탐 3건)까지 줄었지만, 완전한 "0건"은 이 재설계의 범위 밖이었다.**
+Chrome 자동 업데이트처럼 사용자 행동과 무관하게 발생하는 정상 트래픽이 존재하는 한 이벤트 0건은
+판별 로직 개선만으로는 닿지 않는 목표이며, 그 트래픽을 어떻게 다룰지(바이패스 여부와 사유 구분)는
+상위 설계의 몫으로 남는다. 남은 오탐 3건은 각각 원인이 달라(제외 MIME 목록 누락, `octet-stream`
+전제 붕괴, `Sec-Fetch` 없는 폴백 경로) 단일 규칙 수정으로는 닫히지 않는다.
 
 ## 참고
 
